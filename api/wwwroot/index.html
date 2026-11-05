@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Аптека — учебный пример</title>
+<style>
+  :root { --bg:#f4f7fb; --card:#fff; --ink:#1e293b; --mute:#64748b; --acc:#0f766e; --err:#b91c1c; --ok:#15803d; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Calibri, Arial, sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:#0f1b3d; color:#fff; padding:16px 24px; }
+  nav { display:flex; gap:8px; padding:12px 24px; flex-wrap:wrap; }
+  nav button { border:0; padding:8px 16px; border-radius:8px; background:#e2e8f0; cursor:pointer; font-size:15px; }
+  nav button.on { background:var(--acc); color:#fff; }
+  main { padding:0 24px 40px; max-width:1000px; }
+  section { display:none; background:var(--card); border-radius:12px; padding:20px; box-shadow:0 1px 6px #0001; }
+  section.on { display:block; }
+  table { border-collapse:collapse; width:100%; margin-top:12px; font-size:14px; }
+  th, td { border-bottom:1px solid #e2e8f0; padding:6px 8px; text-align:left; vertical-align:top; }
+  th { background:#f1f5f9; }
+  input, select { padding:7px; border:1px solid #cbd5e1; border-radius:6px; font-size:14px; }
+  button.act { padding:8px 14px; border:0; border-radius:8px; background:var(--acc); color:#fff; cursor:pointer; }
+  #msg { margin:12px 24px; padding:10px 14px; border-radius:8px; display:none; max-width:952px; }
+  #msg.ok { display:block; background:#dcfce7; color:var(--ok); }
+  #msg.err { display:block; background:#fee2e2; color:var(--err); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+</style>
+</head>
+<body>
+<header><h2 style="margin:0">Аптека — учебный пример на PostgreSQL</h2></header>
+<nav id="tabs"></nav>
+<div id="msg"></div>
+<main>
+  <section id="medicines">
+    <div class="row"><input id="q" placeholder="Поиск по названию"><button class="act" id="searchBtn">Найти</button><button class="act" id="allBtn">Показать все</button></div>
+    <div id="medTable"></div>
+  </section>
+
+  <section id="order">
+    <p>Шаг 1: клиент. Шаг 2: позиции. Шаг 3: оформить. Если хоть одна позиция не проходит (нет на складе), заказ не создаётся вообще.</p>
+    <div class="row">Клиент: <select id="custSel"></select></div>
+    <div class="row">
+      Лекарство: <select id="medSel"></select>
+      Кол-во: <input id="qty" type="number" min="1" value="1" style="width:70px">
+      <button class="act" id="addBtn">Добавить в заказ</button>
+    </div>
+    <div id="cart"></div>
+    <div class="row"><button class="act" id="checkoutBtn">Оформить заказ (одна транзакция)</button></div>
+    <h3>Продажи</h3>
+    <div id="salesTable"></div>
+  </section>
+
+  <section id="report">
+    <div class="row"><button class="act" id="refreshBtn">Обновить отчёт (REFRESH)</button><button class="act" id="discBtn">Пересчитать скидки (курсор)</button></div>
+    <h3>Выручка по категориям (материализованное представление)</h3>
+    <div id="revTable"></div>
+    <h3>Топ лекарств (функция БД)</h3>
+    <div id="topTable"></div>
+  </section>
+
+  <section id="audit">
+    <p>Журнал заполняют триггеры. Измените цену лекарства в Swagger (PUT /api/medicines/{id}/price) и обновите вкладку.</p>
+    <button class="act" id="auditBtn">Обновить журнал</button>
+    <div id="auditTable"></div>
+  </section>
+</main>
+
+<script>
+const tabs = { medicines:'Лекарства', order:'Оформление', report:'Отчёты', audit:'Аудит' };
+const msg = document.getElementById('msg');
+let cart = [];
+
+function show(text, ok) { msg.textContent = text; msg.className = ok ? 'ok' : 'err'; }
+function clearMsg() { msg.className = ''; msg.textContent = ''; }
+
+async function api(url, method = 'GET', body) {
+  const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const data = res.status === 204 ? null : await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data && data.error ? data.error : 'Ошибка ' + res.status);
+  return data;
+}
+
+function render(el, rows) {
+  el.textContent = '';
+  if (!rows || !rows.length) { el.textContent = 'Нет данных'; return; }
+  const t = document.createElement('table');
+  const head = t.insertRow();
+  Object.keys(rows[0]).forEach(k => { const th = document.createElement('th'); th.textContent = k; head.appendChild(th); });
+  rows.forEach(r => {
+    const tr = t.insertRow();
+    Object.values(r).forEach(v => { tr.insertCell().textContent = Array.isArray(v) ? v.join(', ') : (v ?? ''); });
+  });
+  el.appendChild(t);
+}
+
+function openTab(name) {
+  clearMsg();
+  document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === name));
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.t === name));
+  if (name === 'medicines') loadMedicines();
+  if (name === 'order') loadOrder();
+  if (name === 'report') loadReport();
+  if (name === 'audit') loadAudit();
+}
+
+async function guard(fn) { try { await fn(); } catch (e) { show(e.message, false); } }
+
+const loadMedicines = () => guard(async () => render(document.getElementById('medTable'), await api('/api/medicines')));
+
+async function loadOrder() {
+  await guard(async () => {
+    const [cust, meds, sales] = await Promise.all([api('/api/customers'), api('/api/medicines'), api('/api/sales')]);
+    const fill = (sel, rows, id, label) => { sel.textContent = ''; rows.forEach(r => sel.add(new Option(r[label], r[id]))); };
+    fill(document.getElementById('custSel'), cust, 'cust_id', 'cust_name');
+    fill(document.getElementById('medSel'), meds, 'med_id', 'med_name');
+    render(document.getElementById('salesTable'), sales);
+    renderCart();
+  });
+}
+
+function renderCart() {
+  const el = document.getElementById('cart');
+  render(el, cart.map(c => ({ лекарство: c.name, количество: c.qty })));
+  if (!cart.length) el.textContent = 'Корзина пуста';
+}
+
+const loadReport = () => guard(async () => {
+  render(document.getElementById('revTable'), await api('/api/reports/revenue'));
+  render(document.getElementById('topTable'), await api('/api/reports/top-medicines'));
+});
+
+const loadAudit = () => guard(async () => render(document.getElementById('auditTable'), await api('/api/audit')));
+
+const nav = document.getElementById('tabs');
+Object.entries(tabs).forEach(([k, v]) => {
+  const b = document.createElement('button'); b.textContent = v; b.dataset.t = k; b.onclick = () => openTab(k); nav.appendChild(b);
+});
+
+document.getElementById('searchBtn').onclick = () => guard(async () => {
+  const q = document.getElementById('q').value;
+  render(document.getElementById('medTable'), await api('/api/medicines/search?q=' + encodeURIComponent(q)));
+});
+document.getElementById('allBtn').onclick = loadMedicines;
+
+document.getElementById('addBtn').onclick = () => {
+  const sel = document.getElementById('medSel');
+  cart.push({ medicineId: +sel.value, name: sel.options[sel.selectedIndex].text, qty: +document.getElementById('qty').value });
+  renderCart();
+};
+
+document.getElementById('checkoutBtn').onclick = () => guard(async () => {
+  const res = await api('/api/orders/checkout', 'POST', {
+    customerId: +document.getElementById('custSel').value,
+    items: cart.map(c => ({ medicineId: c.medicineId, qty: c.qty }))
+  });
+  cart = [];
+  show('Заказ №' + res.sale_id + ' оформлен', true);
+  loadOrder();
+});
+
+document.getElementById('refreshBtn').onclick = () => guard(async () => { await api('/api/reports/refresh', 'POST'); show('Отчёт обновлён', true); loadReport(); });
+document.getElementById('discBtn').onclick = () => guard(async () => { const r = await api('/api/discounts/recalculate', 'POST'); show('Изменено скидок: ' + r.changed, true); });
+document.getElementById('auditBtn').onclick = loadAudit;
+
+openTab('medicines');
+</script>
+</body>
+</html>
